@@ -4,19 +4,33 @@
 use core::{cmp, u16};
 use generic_array::{sequence::GenericSequence, ArrayLength, GenericArray};
 use proc_macro_hack::proc_macro_hack;
-use smart_leds_trait::{Color, SmartLedsWrite};
+use smart_leds_trait::{GenericPixel, Pixel, SmartLedsWrite};
 
 pub use generic_array::typenum;
 
 #[proc_macro_hack]
 pub use gamma_lut_macro::gamma_lut;
 
-pub mod color;
-use color::{Color16, SmartLedsWrite16};
-
 type GammaLUT = [u16; 257];
 pub const GAMMA_2_2_LUT: GammaLUT =
     gamma_lut!(gamma: 2.2, linear_cutoff: 1.0/255.0, linear_slope: 1.0);
+
+pub struct ColorChannelTarget {
+    pub interpolated_and_corrected: u16,
+    pub dithered: u8,
+}
+
+impl From<ColorChannelTarget> for u16 {
+    fn from(w: ColorChannelTarget) -> u16 {
+        w.interpolated_and_corrected
+    }
+}
+
+impl From<ColorChannelTarget> for u8 {
+    fn from(w: ColorChannelTarget) -> u8 {
+        w.dithered
+    }
+}
 
 #[derive(Copy, Clone, Default)]
 pub struct ColorChannelState {
@@ -52,10 +66,10 @@ impl ColorChannelState {
         &mut self,
         interp_coefficient: u32,
         gamma_lut: Option<&'static GammaLUT>,
-    ) -> u8 {
-        let target = self.corrected_interpolate(interp_coefficient, gamma_lut);
+    ) -> ColorChannelTarget {
+        let interpolated_and_corrected = self.corrected_interpolate(interp_coefficient, gamma_lut);
 
-        let target = target as i32 + self.residual as i32;
+        let target = interpolated_and_corrected as i32 + self.residual as i32;
 
         let mut val = target + 0x80;
         if val > u16::MAX as i32 {
@@ -66,146 +80,127 @@ impl ColorChannelState {
 
         self.residual = (target - (val * 257)) as i16;
 
-        val as u8
+        ColorChannelTarget {
+            interpolated_and_corrected,
+            dithered: val as u8,
+        }
     }
 }
 
-pub struct DitherState<N>
+pub struct DitherState<PIXEL, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    PIXEL: Pixel,
+    <PIXEL as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <PIXEL as Pixel>::ComponentType: From<ColorChannelTarget>,
+    PIXEL: core::iter::FromIterator<<PIXEL as Pixel>::ComponentType>,
+    N: ArrayLength<GenericArray<ColorChannelState, <PIXEL as Pixel>::ColorCount>>,
 {
     pub gamma_lut: Option<&'static GammaLUT>,
     pub prev_ts: u32,
     pub next_ts: u32,
     pub interp_coefficient: u32,
+    pub pixel_states:
+        GenericArray<GenericArray<ColorChannelState, <PIXEL as Pixel>::ColorCount>, N>,
+}
+
+impl<PIXEL, N> DitherState<PIXEL, N>
+where
+    PIXEL: Pixel,
+    <PIXEL as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <PIXEL as Pixel>::ComponentType: From<ColorChannelTarget>,
+    PIXEL: core::iter::FromIterator<<PIXEL as Pixel>::ComponentType>,
+    N: ArrayLength<GenericArray<ColorChannelState, <PIXEL as Pixel>::ColorCount>>,
+{
+    pub fn iter(&mut self) -> DitherStateIter<PIXEL, N> {
+        DitherStateIter { i: 0, state: self }
+    }
+}
+
+pub struct DitherStateIter<'a, PIXEL, N>
+where
+    PIXEL: Pixel,
+    <PIXEL as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <PIXEL as Pixel>::ComponentType: From<ColorChannelTarget>,
+    PIXEL: core::iter::FromIterator<<PIXEL as Pixel>::ComponentType>,
+    N: ArrayLength<GenericArray<ColorChannelState, <PIXEL as Pixel>::ColorCount>>,
+{
     pub i: usize,
-    pub pixel_states: GenericArray<[ColorChannelState; 3], N>,
+    pub state: &'a mut DitherState<PIXEL, N>,
 }
 
-impl<N> DitherState<N>
+impl<'a, PIXEL, N> Iterator for DitherStateIter<'a, PIXEL, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    PIXEL: Pixel,
+    <PIXEL as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <PIXEL as Pixel>::ComponentType: From<ColorChannelTarget>,
+    PIXEL: core::iter::FromIterator<<PIXEL as Pixel>::ComponentType>,
+    N: ArrayLength<GenericArray<ColorChannelState, <PIXEL as Pixel>::ColorCount>>,
 {
-    pub fn iter_color(&mut self) -> DitherStateIterColor<N> {
-        DitherStateIterColor { state: self }
-    }
+    type Item = PIXEL;
 
-    pub fn iter_color16(&mut self) -> DitherStateIterColor16<N> {
-        DitherStateIterColor16 { state: self }
-    }
-}
-
-pub struct DitherStateIterColor<'a, N>
-where
-    N: ArrayLength<[ColorChannelState; 3]>,
-{
-    pub state: &'a mut DitherState<N>,
-}
-
-impl<'a, N> Iterator for DitherStateIterColor<'a, N>
-where
-    N: ArrayLength<[ColorChannelState; 3]>,
-{
-    type Item = Color;
-
-    fn next(&mut self) -> Option<Color> {
-        if self.state.i >= self.state.pixel_states.len() {
-            self.state.i = 0;
+    fn next(&mut self) -> Option<PIXEL> {
+        if self.i >= self.state.pixel_states.len() {
+            self.i = 0;
             return None;
         }
 
         let interp_coefficient = self.state.interp_coefficient;
         let gamma_lut = self.state.gamma_lut;
 
-        let color: GenericArray<u8, typenum::U3> = self.state.pixel_states[self.state.i]
+        let color = self.state.pixel_states[self.i]
             .iter_mut()
             .map(|channel_state| {
-                channel_state.corrected_interpolate_and_dither(interp_coefficient, gamma_lut)
+                channel_state
+                    .corrected_interpolate_and_dither(interp_coefficient, gamma_lut)
+                    .into()
             })
             .collect();
 
-        self.state.i = self.state.i + 1;
+        self.i = self.i + 1;
 
-        Some(Color {
-            r: color[0],
-            g: color[1],
-            b: color[2],
-        })
-    }
-}
-
-pub struct DitherStateIterColor16<'a, N>
-where
-    N: ArrayLength<[ColorChannelState; 3]>,
-{
-    pub state: &'a mut DitherState<N>,
-}
-
-impl<'a, N> Iterator for DitherStateIterColor16<'a, N>
-where
-    N: ArrayLength<[ColorChannelState; 3]>,
-{
-    type Item = Color16;
-
-    fn next(&mut self) -> Option<Color16> {
-        if self.state.i >= self.state.pixel_states.len() {
-            self.state.i = 0;
-            return None;
-        }
-
-        let interp_coefficient = self.state.interp_coefficient;
-        let gamma_lut = self.state.gamma_lut;
-
-        let color: GenericArray<u16, typenum::U3> = self.state.pixel_states[self.state.i]
-            .iter_mut()
-            .map(|channel_state| channel_state.corrected_interpolate(interp_coefficient, gamma_lut))
-            .collect();
-
-        self.state.i = self.state.i + 1;
-
-        Some(Color16 {
-            r: color[0],
-            g: color[1],
-            b: color[2],
-        })
+        Some(color)
     }
 }
 
 pub struct DitherableLeds<LEDS, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    N: ArrayLength<GenericArray<ColorChannelState, <LEDS::Pixel as Pixel>::ColorCount>>,
+    LEDS: SmartLedsWrite,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <LEDS::Pixel as Pixel>::ComponentType: From<ColorChannelTarget>,
+    LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
+    LEDS::Pixel: Pixel,
 {
     pub leds: LEDS,
-    pub state: DitherState<N>,
+    pub state: DitherState<LEDS::Pixel, N>,
 }
 
 impl<LEDS, N> DitherableLeds<LEDS, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    N: ArrayLength<GenericArray<ColorChannelState, <LEDS::Pixel as Pixel>::ColorCount>>,
+    LEDS: SmartLedsWrite,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <LEDS::Pixel as Pixel>::ComponentType: From<ColorChannelTarget>,
+    LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
+    LEDS::Pixel: Pixel,
 {
     pub fn new(leds: LEDS, gamma_lut: Option<&'static GammaLUT>) -> DitherableLeds<LEDS, N> {
         DitherableLeds {
             leds,
             state: DitherState {
                 pixel_states: GenericArray::generate(|_i: usize| {
-                    [ColorChannelState {
+                    GenericArray::generate(|_i: usize| ColorChannelState {
                         prev: 0,
                         next: 0,
                         residual: 0,
-                    }; 3]
+                    })
                 }),
                 next_ts: 0,
                 prev_ts: 0,
                 interp_coefficient: 0,
-                i: 0,
                 gamma_lut: gamma_lut,
             },
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.state.interp_coefficient = 0;
-        self.state.i = 0;
     }
 
     pub fn now(&mut self, now: u32) -> DitherableLedsInstant<LEDS, N> {
@@ -215,7 +210,12 @@ where
 
 pub struct DitherableLedsInstant<'a, LEDS, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    N: ArrayLength<GenericArray<ColorChannelState, <LEDS::Pixel as Pixel>::ColorCount>>,
+    LEDS: SmartLedsWrite,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <LEDS::Pixel as Pixel>::ComponentType: From<ColorChannelTarget>,
+    LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
+    LEDS::Pixel: Pixel,
 {
     pub now: u32,
     pub leds: &'a mut DitherableLeds<LEDS, N>,
@@ -223,12 +223,14 @@ where
 
 impl<'a, LEDS, N> DitherableLedsInstant<'a, LEDS, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    N: ArrayLength<GenericArray<ColorChannelState, <LEDS::Pixel as Pixel>::ColorCount>>,
+    LEDS: SmartLedsWrite,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <LEDS::Pixel as Pixel>::ComponentType: From<ColorChannelTarget>,
+    LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
+    LEDS::Pixel: Pixel,
 {
-    pub fn flush16(&mut self)
-    where
-        LEDS: SmartLedsWrite16,
-    {
+    pub fn flush_rgb(&mut self) {
         let diff = self
             .leds
             .state
@@ -239,50 +241,34 @@ where
             self.leds.state.interp_coefficient = (cmp::min(elapsed, diff) << 16) / diff;
         }
 
-        self.leds
-            .leds
-            .write(&mut self.leds.state.iter_color16())
-            .ok();
-    }
-
-    pub fn flush(&mut self)
-    where
-        LEDS: SmartLedsWrite,
-    {
-        let diff = self
-            .leds
-            .state
-            .next_ts
-            .wrapping_sub(self.leds.state.prev_ts);
-        if diff > 0 {
-            let elapsed = self.now.wrapping_sub(self.leds.state.next_ts);
-            self.leds.state.interp_coefficient = (cmp::min(elapsed, diff) << 16) / diff;
-        }
-
-        self.leds.leds.write(&mut self.leds.state.iter_color()).ok();
+        self.leds.leds.write(&mut self.leds.state.iter()).ok();
     }
 }
 
 impl<'a, LEDS, N> SmartLedsWrite for DitherableLedsInstant<'a, LEDS, N>
 where
-    N: ArrayLength<[ColorChannelState; 3]>,
+    N: ArrayLength<GenericArray<ColorChannelState, <LEDS::Pixel as Pixel>::ColorCount>>,
+    LEDS: SmartLedsWrite,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<ColorChannelState>,
+    <LEDS::Pixel as Pixel>::ColorCount: generic_array::ArrayLength<u8>,
+    <LEDS::Pixel as Pixel>::ComponentType: From<ColorChannelTarget>,
+    LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
+    LEDS::Pixel: Pixel,
 {
+    type Pixel = GenericPixel<<LEDS::Pixel as Pixel>::ColorCount, u8>;
     type Error = ();
 
-    fn write<I>(&mut self, iterator: I) -> Result<(), ()>
+    fn write<T, I>(&mut self, iterator: T) -> Result<(), ()>
     where
-        I: Iterator<Item = Color>,
+        T: Iterator<Item = I>,
+        I: Into<Self::Pixel>,
     {
-        self.leds.reset();
-
         self.leds.state.prev_ts = self.leds.state.next_ts;
         self.leds.state.next_ts = self.now;
 
         for (pixel_state, new_pixel) in self.leds.state.pixel_states.iter_mut().zip(iterator) {
-            for (channel_state, new_val) in pixel_state
-                .iter_mut()
-                .zip([new_pixel.r, new_pixel.g, new_pixel.b].iter())
-            {
+            let new_pixel = new_pixel.into();
+            for (channel_state, new_val) in pixel_state.iter_mut().zip(new_pixel.iter()) {
                 channel_state.prev = channel_state.next;
                 channel_state.next = *new_val;
             }
