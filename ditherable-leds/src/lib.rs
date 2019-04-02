@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(const_fn)]
 
 use core::{cmp, u16};
 use generic_array::{sequence::GenericSequence, ArrayLength, GenericArray};
@@ -230,7 +229,7 @@ where
     LEDS::Pixel: core::iter::FromIterator<<LEDS::Pixel as Pixel>::ComponentType>,
     LEDS::Pixel: Pixel,
 {
-    pub fn flush_rgb(&mut self) {
+    pub fn flush(&mut self) {
         let diff = self
             .leds
             .state
