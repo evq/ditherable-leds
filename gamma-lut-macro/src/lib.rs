@@ -7,7 +7,7 @@ extern crate proc_macro2;
 use proc_macro::TokenStream;
 use proc_macro_hack::proc_macro_hack;
 use quote::quote;
-use std::{u16, u8};
+use std::u16;
 use syn::parse::Parse;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
@@ -88,8 +88,12 @@ pub fn gamma_lut(input: TokenStream) -> TokenStream {
 
     let mut lut = Vec::new();
     for i in 0..257 {
-        let corrected = params.calculate_correction(i as f32 / u8::MAX as f32);
-        lut.push((corrected * u16::MAX as f32) as u16);
+        let corrected = params.calculate_correction((i << 8) as f32 / u16::MAX as f32);
+        lut.push(
+            (corrected * u16::MAX as f32)
+                .min(u16::MAX as f32)
+                .max(u16::MIN as f32) as u16,
+        );
     }
     let expanded = quote! {
         [#(#lut),*];
