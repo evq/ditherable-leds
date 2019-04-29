@@ -5,7 +5,8 @@ authors = ["eV <ev@7pr.xyz>"]
 edition = "2018"
 
 [dependencies]
-smart-leds-trait = { git = "https://github.com/evq/smart-leds-trait", branch = "wip" }
+rgb = "0.8"
+smart-leds-trait = { git = "https://github.com/smart-leds-rs/smart-leds-trait", branch = "generify" }
 generic-array = "0.11.1"
 gamma-lut-macro = { path = "../gamma-lut-macro" }
 proc-macro-hack = "0.5"
